@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-ReAct Agent v5 — Agente con tool calling + Predictive Scheduler
+ReAct Agent v5 — tool-calling agent + Predictive Scheduler
 ================================================================
 
-Il prototipo diventa un AGENTE VERO (§3.1 del rapporto):
+The prototype becomes a REAL AGENT (§3.1 of the report):
 
     Agent (ReAct / tool-calling loop)
         ↓
-    Resource-Aware Predictive Scheduler   ← decide continue/compress/.../checkpoint
+    Resource-Aware Predictive Scheduler   ← decides continue/compress/.../checkpoint
         ↓
     LLM Provider (Mock, Ollama via LiteLLM, ...)
 
-Il ciclo ReAct classico:
-    Thought  → l'agente ragiona su cosa fare
-    Action   → sceglie un tool (read_file, list_files, search, calculator, write_note)
-    Observation → riceve il risultato del tool
-    ... ripete finché non produce "Final Answer".
+The classic ReAct loop:
+    Thought  → the agent reasons about what to do
+    Action   → it picks a tool (read_file, list_files, search, calculator, write_note)
+    Observation → it receives the tool result
+    ... repeats until it produces a "Final Answer".
 
-Lo scheduler si inserisce PRIMA di ogni chiamata LLM: se le risorse scarseggiano
-prova compressione → summarization → model switch → e come ultima risorsa fa un
-graceful checkpoint. Al riavvio l'agente riparte da dove si era fermato (Warm Start),
-senza ri-eseguire i tool già eseguiti (chiavi di idempotenza, §3.1).
+The scheduler steps in BEFORE every LLM call: when resources run low it tries
+compression → summarization → model switch → and, as a last resort, performs a
+graceful checkpoint. On restart the agent resumes where it stopped (warm start),
+without re-running tools that already ran (idempotency keys, §3.1).
 
-Uso:
-    python3 react_agent_v5.py                  # demo con MockBackend
-    (in fondo al file puoi passare a "litellm" + Ollama)
+Usage:
+    python3 react_agent.py                  # demo with MockBackend (SIMULATED numbers)
+    (at the bottom of the file you can switch to "litellm" + Ollama)
 """
 
 import json
@@ -42,53 +42,53 @@ CHECKPOINT_FILE = "checkpoint_react_v5.json"
 
 
 # =============================================================================
-# 1. TOOLS — semplici ma reali
+# 1. TOOLS — simple but real
 # =============================================================================
 
 def tool_list_files(arg: str) -> str:
     import os
     try:
         files = sorted(os.listdir(arg or "."))[:20]
-        return "File nella cartella: " + ", ".join(files)
+        return "Files in the folder: " + ", ".join(files)
     except Exception as e:
-        return f"Errore: {e}"
+        return f"Error: {e}"
 
 
 def tool_read_file(arg: str) -> str:
     try:
         with open(arg) as f:
             content = f.read(1500)
-        return f"Contenuto di {arg} (primi 1500 caratteri):\n{content}"
+        return f"Content of {arg} (first 1500 characters):\n{content}"
     except Exception as e:
-        return f"Errore: {e}"
+        return f"Error: {e}"
 
 
 def tool_search(arg: str) -> str:
-    """Ricerca simulata (nessuna rete). Sostituibile con una vera API."""
+    """Simulated search (no network). Replaceable with a real API."""
     fake_db = {
-        "checkpoint": "Il checkpointing proattivo salva lo stato prima dell'esaurimento risorse.",
-        "rate limit": "I provider LLM espongono header come x-ratelimit-remaining-tokens.",
-        "react": "ReAct alterna ragionamento (Thought) e azioni (Action) con tool.",
+        "checkpoint": "Proactive checkpointing saves state before resources run out.",
+        "rate limit": "LLM providers expose headers like x-ratelimit-remaining-tokens.",
+        "react": "ReAct alternates reasoning (Thought) and actions (Action) with tools.",
     }
     for key, val in fake_db.items():
         if key in arg.lower():
             return f"[search] {val}"
-    return f"[search] Nessun risultato preciso per '{arg}'. Prova altri termini."
+    return f"[search] No exact result for '{arg}'. Try different terms."
 
 
 def tool_calculator(arg: str) -> str:
     try:
         if not re.fullmatch(r"[0-9+\-*/(). %]+", arg):
-            return "Errore: espressione non valida (solo numeri e + - * / % parentesi)."
-        return f"Risultato: {eval(arg)}"  # input già validato dalla regex
+            return "Error: invalid expression (only digits and + - * / % parentheses)."
+        return f"Result: {eval(arg)}"  # input already validated by the regex
     except Exception as e:
-        return f"Errore: {e}"
+        return f"Error: {e}"
 
 
 def tool_write_note(arg: str) -> str:
-    with open("note_agente.txt", "a") as f:
+    with open("agent_notes.txt", "a") as f:
         f.write(arg + "\n")
-    return "Nota salvata in note_agente.txt"
+    return "Note saved to agent_notes.txt"
 
 
 TOOLS = {
@@ -99,38 +99,38 @@ TOOLS = {
     "write_note": tool_write_note,
 }
 
-SYSTEM_PROMPT = """Sei un agente autonomo. Risolvi il task usando i tool disponibili.
-Rispondi SEMPRE in questo formato (una tripletta per volta):
+SYSTEM_PROMPT = """You are an autonomous agent. Solve the task using the available tools.
+ALWAYS reply in this format (one triplet at a time):
 
-Thought: <il tuo ragionamento>
-Action: <nome_tool>
-Action Input: <argomento del tool>
+Thought: <your reasoning>
+Action: <tool_name>
+Action Input: <tool argument>
 
-Tool disponibili: list_files, read_file, search, calculator, write_note.
+Available tools: list_files, read_file, search, calculator, write_note.
 
-Quando hai finito, rispondi con:
-Thought: <ragionamento finale>
-Final Answer: <risposta completa al task>
+When you are done, reply with:
+Thought: <final reasoning>
+Final Answer: <complete answer to the task>
 """
 
 
 # =============================================================================
-# 2. MOCK "SCRIPTED" — un finto LLM che parla in formato ReAct
-#    (serve per testare l'agente senza modello vero)
+# 2. SCRIPTED MOCK — a fake LLM that speaks the ReAct format
+#    (lets you test the agent without a real model; numbers are SIMULATED)
 # =============================================================================
 
 class ScriptedReActBackend(BaseLLMBackend):
     name = "mock-react"
 
     SCRIPT = [
-        ("Devo capire cosa contiene la cartella di lavoro.", "list_files", "."),
-        ("Cerco informazioni sul checkpointing.", "search", "checkpoint proattivo"),
-        ("Verifico come funziona il rate limit.", "search", "rate limit header"),
-        ("Faccio un calcolo di esempio sul budget.", "calculator", "6500 - 320*12"),
-        ("Salvo un appunto sui risultati.", "write_note", "Budget residuo stimato dopo 12 passi: 2660 token"),
-        ("Approfondisco il pattern ReAct.", "search", "react pattern"),
-        ("Ricontrollo i file generati.", "list_files", "."),
-        ("Calcolo il margine di sicurezza con k=2 e sigma=90.", "calculator", "2*90"),
+        ("I need to see what the working folder contains.", "list_files", "."),
+        ("Let me look up information on checkpointing.", "search", "proactive checkpoint"),
+        ("Let me check how rate limits work.", "search", "rate limit header"),
+        ("Let me run a sample budget calculation.", "calculator", "6500 - 320*12"),
+        ("Let me save a note about the results.", "write_note", "Estimated remaining budget after 12 steps: 2660 tokens"),
+        ("Let me dig into the ReAct pattern.", "search", "react pattern"),
+        ("Let me re-check the generated files.", "list_files", "."),
+        ("Compute the safety margin with k=2 and sigma=90.", "calculator", "2*90"),
     ]
 
     def __init__(self, avg_tokens: int = 300, name: str = "mock-react"):
@@ -147,10 +147,10 @@ class ScriptedReActBackend(BaseLLMBackend):
             thought, action, arg = self.SCRIPT[i]
             text = f"Thought: {thought}\nAction: {action}\nAction Input: {arg}"
         else:
-            text = ("Thought: Ho raccolto abbastanza informazioni.\n"
-                    "Final Answer: Analisi completata: cartella ispezionata, concetti chiave "
-                    "verificati (checkpoint proattivo, rate limit header, pattern ReAct) e "
-                    "calcoli di budget salvati in note_agente.txt.")
+            text = ("Thought: I have gathered enough information.\n"
+                    "Final Answer: Analysis complete: folder inspected, key concepts "
+                    "verified (proactive checkpointing, rate-limit headers, ReAct pattern) and "
+                    "budget calculations saved to agent_notes.txt.")
         return text, min(tokens, max_tokens)
 
     def estimate_tokens(self, text: str) -> int:
@@ -158,12 +158,12 @@ class ScriptedReActBackend(BaseLLMBackend):
 
 
 # =============================================================================
-# 3. PARSER ReAct
+# 3. ReAct PARSER
 # =============================================================================
 
 def parse_react(text: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
-    """Ritorna (thought, action, action_input, final_answer)."""
-    # Thought multilinea: si ferma ad Action / Final Answer (miglioria da review esterna)
+    """Returns (thought, action, action_input, final_answer)."""
+    # Multiline Thought: stops at Action / Final Answer (improvement from external review)
     thought = re.search(r"Thought:\s*(.+?)(?=\nAction:|\nFinal Answer:|$)", text, re.DOTALL)
     final = re.search(r"Final Answer:\s*(.+)", text, re.DOTALL)
     action = re.search(r"Action:\s*(\w+)", text)
@@ -177,7 +177,7 @@ def parse_react(text: str) -> Tuple[str, Optional[str], Optional[str], Optional[
 
 
 # =============================================================================
-# 4. CICLO DELL'AGENTE con scheduler integrato
+# 4. AGENT LOOP with integrated scheduler
 # =============================================================================
 
 def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3.2",
@@ -192,7 +192,7 @@ def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3
     else:
         backend = ScriptedReActBackend(avg_tokens=300, name="mock-react")
         economy = ScriptedReActBackend(avg_tokens=130, name="mock-react-eco")
-        economy.call_count = 99  # il modello economico va dritto alla risposta finale
+        economy.call_count = 99  # the economy model goes straight to the final answer
 
     scheduler = PredictiveScheduler(
         backend=backend,
@@ -201,16 +201,16 @@ def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3
         safety_factor_k=2.0,
     )
 
-    # ---- Warm Start (§3.1): riprende dal checkpoint se esiste ----
+    # ---- Warm start (§3.1): resumes from the checkpoint if present ----
     state = scheduler.load_checkpoint(CHECKPOINT_FILE)
     if state:
-        scheduler.remaining_tokens = initial_remaining_tokens  # finestra resettata
-        # tool già eseguiti: NON rifarli (le chiavi tool hanno formato "azione|input")
+        scheduler.remaining_tokens = initial_remaining_tokens  # window has reset
+        # tools already run: do NOT re-run them (tool keys have the "action|input" format)
         executed_tools = {k for k in state.idempotency_keys if "|" in k}
         if isinstance(backend, ScriptedReActBackend):
-            backend.call_count = state.step                    # riallinea lo script
-        print(f"↻ WARM START: riparto dal passo {state.step + 1}, "
-              f"{len(executed_tools)} azioni già eseguite (non verranno ripetute)")
+            backend.call_count = state.step                    # realign the script
+        print(f"↻ WARM START: resuming from step {state.step + 1}, "
+              f"{len(executed_tools)} actions already executed (they will not be repeated)")
     else:
         state = AgentState(
             task_description=task,
@@ -228,7 +228,7 @@ def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3
              "model_switch": "🔀", "checkpoint": "🛑"}
 
     for _ in range(max_react_steps):
-        # --- Lo scheduler decide e (se serve) agisce PRIMA della chiamata LLM ---
+        # --- The scheduler decides and (if needed) acts BEFORE the LLM call ---
         d = scheduler.execute_step(state)
         print(f"[scheduler] step {d['step']:2d} | rem {d['remaining']:5d} | "
               f"risk {d['risk']:.2f} | {icons[d['action']]} {d['action']}")
@@ -236,31 +236,31 @@ def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3
         if d["action"] == "checkpoint":
             scheduler.save_checkpoint(state, CHECKPOINT_FILE)
             print(f"\n🛑 GRACEFUL CHECKPOINT → {CHECKPOINT_FILE}")
-            print("   Rilancia lo script per riprendere da qui (Warm Start).")
+            print("   Run the script again to resume from here (warm start).")
             return None
 
-        # --- L'ultima risposta dell'assistente è la mossa ReAct ---
+        # --- The assistant's last reply is the ReAct move ---
         llm_text = state.messages[-1]["content"]
         thought, action, arg, final = parse_react(llm_text)
 
         if final:
             print("-" * 78)
             print(f"✅ FINAL ANSWER: {final}")
-            print(f"Passi: {state.step} | Token usati: {state.total_tokens_used}")
-            print("\nMetriche scheduler (§8.2):")
+            print(f"Steps: {state.step} | Tokens used: {state.total_tokens_used}")
+            print("\nScheduler metrics (§8.2):")
             for k, v in scheduler.metrics_summary().items():
                 print(f"  {k}: {v}")
-            # task finito → il checkpoint non serve più
+            # task finished → the checkpoint is no longer needed
             import os
             if os.path.exists(CHECKPOINT_FILE):
                 os.remove(CHECKPOINT_FILE)
             return final
 
         if action and action in TOOLS:
-            # chiave di idempotenza: stessa azione+input non viene rieseguita (§3.1)
+            # idempotency key: the same action+input is never re-executed (§3.1)
             key = f"{action}|{arg}"
             if key in executed_tools:
-                observation = "[skip] Azione già eseguita prima del checkpoint (idempotenza)."
+                observation = "[skip] Action already executed before the checkpoint (idempotency)."
             else:
                 observation = TOOLS[action](arg or "")
                 executed_tools.add(key)
@@ -269,18 +269,18 @@ def run_agent(task: str, backend_type: str = "mock", model: str = "ollama/llama3
             print(f"  Action:  {action}({arg}) → {observation[:80]}")
             state.add_message("user", f"Observation: {observation[:400]}")
         else:
-            state.add_message("user", "Observation: formato non valido. Usa Thought/Action/Action Input o Final Answer.")
+            state.add_message("user", "Observation: invalid format. Use Thought/Action/Action Input or Final Answer.")
 
-    print("Limite di passi raggiunto senza Final Answer.")
+    print("Step limit reached without a Final Answer.")
     return None
 
 
 if __name__ == "__main__":
     run_agent(
-        task="Ispeziona la cartella di lavoro, raccogli informazioni sul checkpointing "
-             "proattivo e sul rate limiting, fai i calcoli di budget necessari e "
-             "produci un riepilogo finale.",
-        backend_type="mock",              # cambia in "litellm" per Ollama/OpenAI/...
+        task="Inspect the working folder, gather information on proactive "
+             "checkpointing and rate limiting, run the necessary budget "
+             "calculations and produce a final summary.",
+        backend_type="mock",              # switch to "litellm" for Ollama/OpenAI/...
         model="ollama/llama3.2",
         initial_remaining_tokens=6500,
     )

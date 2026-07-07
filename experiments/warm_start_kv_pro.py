@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-WARM START VERO — Esperimento PRO: modello thinking + task grande
+TRUE WARM START — PRO experiment: thinking model + large task
 ==================================================================
 
-Differenze rispetto all'esperimento base (warm_start_kv.py):
+Differences from the base experiment (warm_start_kv.py):
 
-  • Modello THINKING (Qwen3): ragiona dentro <think>...</think> prima di
-    rispondere — scelto automaticamente in base alla RAM del Mac.
-  • Task GRANDE: contesto da ~7.000 token (vs 2.700) — la KV-cache su disco
-    peserà ~1 GB e il divario freddo/caldo diventa molto più evidente.
-  • Misure RIPETUTE: ogni ripresa (fredda e calda) è misurata N volte e
-    viene riportata la media — valutazione più esatta.
-  • Prompt costruito con il chat template ufficiale del modello
-    (endpoint /apply-template), così il thinking si attiva correttamente.
+  • THINKING model (Qwen3): reasons inside <think>...</think> before
+    answering — chosen automatically based on the Mac's RAM.
+  • LARGE task: ~7,000-token context (vs 2,700) — the on-disk KV-cache
+    weighs ~1 GB and the cold/warm gap becomes far more visible.
+  • REPEATED measurements: every resume (cold and warm) is measured N times
+    and the mean is reported — a more exact evaluation.
+  • Prompt built with the model's official chat template
+    (/apply-template endpoint), so thinking activates correctly.
 
-Prerequisito: llama-server avviato da avvia_warm_start_kv_pro.command.
+Prerequisite: a running llama-server.
 """
 
 import json
@@ -25,13 +25,13 @@ import time
 try:
     import requests
 except ImportError:
-    print("Manca 'requests'. Esegui: pip3 install requests")
+    print("'requests' is missing. Run: pip3 install requests")
     sys.exit(1)
 
 SERVER = "http://127.0.0.1:8080"
-KV_FILE = "agente_kv_pro.bin"
-REPS = 2          # ripetizioni per misura (alza a 3 se vuoi ancora più precisione)
-N_PREDICT = 640   # spazio per il thinking + risposta
+KV_FILE = "agent_kv_pro.bin"
+REPS = 2          # repetitions per measurement (raise to 3 for extra precision)
+N_PREDICT = 640   # room for thinking + answer
 
 
 # ---------------------------------------------------------------------------
@@ -46,14 +46,14 @@ def server_ok() -> bool:
 
 
 def apply_template(messages) -> str:
-    """Usa il chat template ufficiale del modello (attiva il thinking)."""
+    """Uses the model's official chat template (activates thinking)."""
     try:
         r = requests.post(f"{SERVER}/apply-template", json={"messages": messages}, timeout=30)
         if r.status_code == 200:
             return r.json()["prompt"]
     except Exception:
         pass
-    # Fallback: template ChatML (quello di Qwen)
+    # Fallback: ChatML template (Qwen's)
     out = ""
     for m in messages:
         out += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
@@ -64,7 +64,7 @@ def completion(prompt: str, n_predict: int = N_PREDICT):
     r = requests.post(f"{SERVER}/completion", json={
         "prompt": prompt,
         "n_predict": n_predict,
-        "temperature": 0.6, "top_p": 0.95,   # raccomandati per Qwen3 thinking
+        "temperature": 0.6, "top_p": 0.95,   # recommended for Qwen3 thinking
         "cache_prompt": True,
         "id_slot": 0,
     }, timeout=1800)
@@ -93,25 +93,25 @@ def kv_file_size_mb() -> float:
 
 
 # ---------------------------------------------------------------------------
-# Task grande: registro di ~120 passi di un agente (≈7.000 token)
+# Large task: a ~120-step agent log (≈7,000 tokens)
 # ---------------------------------------------------------------------------
 
 def build_big_context() -> str:
-    system = ("Sei un agente autonomo esperto di architetture software. "
-              "Analizzi sistemi distribuiti e produci raccomandazioni di refactoring "
-              "motivate e prioritizzate.")
+    system = ("You are an autonomous agent expert in software architecture. "
+              "You analyze distributed systems and produce justified, "
+              "prioritized refactoring recommendations.")
     log = []
     for i in range(1, 121):
         log.append(
-            f"PASSO {i}: ispezionato il modulo servizio_{i:03d}. "
-            f"Dipendenze dirette: {2 + i % 7}; latenza p95: {60 + (i * 7) % 240} ms; "
-            f"error rate: {round(0.1 + (i % 9) * 0.4, 1)}%; copertura test: {30 + (i * 13) % 60}%. "
-            f"Osservazioni: {'accoppiamento stretto con il gateway di autenticazione' if i % 3 == 0 else 'gestione errori incompleta nei percorsi asincroni' if i % 3 == 1 else 'query N+1 verso il database ordini e cache assente'}. "
+            f"STEP {i}: inspected module service_{i:03d}. "
+            f"Direct dependencies: {2 + i % 7}; p95 latency: {60 + (i * 7) % 240} ms; "
+            f"error rate: {round(0.1 + (i % 9) * 0.4, 1)}%; test coverage: {30 + (i * 13) % 60}%. "
+            f"Observations: {'tight coupling to the authentication gateway' if i % 3 == 0 else 'incomplete error handling on async paths' if i % 3 == 1 else 'N+1 queries to the orders database and no cache'}. "
         )
-    question = ("Analizza l'intero registro qui sopra. Identifica i 3 moduli più critici "
-                "da rifattorizzare, spiega perché proprio quei tre confrontando le metriche, "
-                "e proponi l'ordine di intervento.")
-    user = "REGISTRO DELLE ISPEZIONI:\n" + "\n".join(log) + "\n\n" + question
+    question = ("Analyze the entire log above. Identify the 3 most critical modules "
+                "to refactor, explain why those three by comparing the metrics, "
+                "and propose the order of intervention.")
+    user = "INSPECTION LOG:\n" + "\n".join(log) + "\n\n" + question
     return apply_template([
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -119,78 +119,78 @@ def build_big_context() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Esperimento con misure ripetute
+# Experiment with repeated measurements
 # ---------------------------------------------------------------------------
 
 def main():
     print("=" * 78)
-    print("  WARM START VERO — PRO: modello thinking, task grande, misure ripetute")
+    print("  TRUE WARM START — PRO: thinking model, large task, repeated measures")
     print("=" * 78)
 
     if not server_ok():
-        print("ERRORE: llama-server non risponde. Avvialo con avvia_warm_start_kv_pro.command")
+        print("ERROR: llama-server is not responding. Start it first.")
         sys.exit(1)
 
     prompt = build_big_context()
-    print(f"\nContesto costruito: ~{len(prompt) // 4} token stimati")
+    print(f"\nContext built: ~{len(prompt) // 4} estimated tokens")
 
-    # --- 1. Sessione di lavoro (con thinking) -----------------------------
-    print("\n[1] Sessione di lavoro: il modello ragiona sul task grande...", flush=True)
+    # --- 1. Work session (with thinking) -----------------------------------
+    print("\n[1] Work session: the model reasons over the large task...", flush=True)
     text, t = completion(prompt)
-    print(f"    Prefill: {t.get('prompt_n', '?')} token in {t.get('prompt_ms', 0) / 1000:.1f} s "
+    print(f"    Prefill: {t.get('prompt_n', '?')} tokens in {t.get('prompt_ms', 0) / 1000:.1f} s "
           f"({t.get('prompt_per_second', 0):.0f} tok/s)")
     if "<think>" in text:
         think = text.split("<think>")[1].split("</think>")[0].strip()
         answer = text.split("</think>")[-1].strip()
-        print(f"    Thinking (estratto): {think[:140]}...")
-        print(f"    Risposta (estratto): {answer[:140]}...")
+        print(f"    Thinking (excerpt): {think[:140]}...")
+        print(f"    Answer (excerpt): {answer[:140]}...")
     else:
-        print(f"    Risposta (estratto): {text.strip()[:140]}...")
+        print(f"    Answer (excerpt): {text.strip()[:140]}...")
 
-    # --- 2. Checkpoint della KV su disco -----------------------------------
-    print("\n[2] Checkpoint: serializzo la KV-cache su disco...", flush=True)
+    # --- 2. KV checkpoint to disk -------------------------------------------
+    print("\n[2] Checkpoint: serializing the KV-cache to disk...", flush=True)
     ms_save, _ = slot_action("save")
-    print(f"    Salvata in {ms_save:.0f} ms | file: {kv_file_size_mb():.0f} MB")
+    print(f"    Saved in {ms_save:.0f} ms | file: {kv_file_size_mb():.0f} MB")
 
-    # --- 3+4. Misure ripetute: FREDDA vs CALDA ------------------------------
+    # --- 3+4. Repeated measurements: COLD vs WARM ----------------------------
     cold_ms, cold_n = [], []
     warm_ms, warm_n, restore_ms = [], [], []
 
     for rep in range(1, REPS + 1):
-        print(f"\n[3] Ripresa FREDDA (misura {rep}/{REPS}): erase + re-prefill completo...", flush=True)
+        print(f"\n[3] COLD resume (measure {rep}/{REPS}): erase + full re-prefill...", flush=True)
         slot_action("erase", quiet=True)
-        _, tc = completion(prompt, n_predict=8)   # pochi token: misuriamo il prefill
+        _, tc = completion(prompt, n_predict=8)   # few tokens: we measure the prefill
         cold_ms.append(tc.get("prompt_ms", 0)); cold_n.append(tc.get("prompt_n", 0))
-        print(f"    {tc.get('prompt_n', '?')} token ricalcolati in {tc.get('prompt_ms', 0) / 1000:.1f} s")
+        print(f"    {tc.get('prompt_n', '?')} tokens recomputed in {tc.get('prompt_ms', 0) / 1000:.1f} s")
 
-        print(f"[4] Ripresa CALDA (misura {rep}/{REPS}): erase + restore dal disco...", flush=True)
+        print(f"[4] WARM resume (measure {rep}/{REPS}): erase + restore from disk...", flush=True)
         slot_action("erase", quiet=True)
         ms_r, _ = slot_action("restore", quiet=True)
         _, tw = completion(prompt, n_predict=8)
         warm_ms.append(tw.get("prompt_ms", 0)); warm_n.append(tw.get("prompt_n", 0)); restore_ms.append(ms_r)
-        print(f"    restore {ms_r:.0f} ms + {tw.get('prompt_n', '?')} token in {tw.get('prompt_ms', 0):.0f} ms")
+        print(f"    restore {ms_r:.0f} ms + {tw.get('prompt_n', '?')} tokens in {tw.get('prompt_ms', 0):.0f} ms")
 
-    # --- Riepilogo -----------------------------------------------------------
+    # --- Summary --------------------------------------------------------------
     c_ms, c_n = statistics.mean(cold_ms), statistics.mean(cold_n)
     w_ms, w_n = statistics.mean(warm_ms), statistics.mean(warm_n)
     r_ms = statistics.mean(restore_ms)
     warm_total = w_ms + r_ms
 
     print("\n" + "=" * 78)
-    print(f"  RISULTATO (media su {REPS} misure)")
+    print(f"  RESULT (mean over {REPS} measurements)")
     print("=" * 78)
-    print(f"  Ripresa FREDDA: {c_n:7.0f} token ricalcolati | {c_ms / 1000:8.1f} s")
-    print(f"  Ripresa CALDA:  {w_n:7.0f} token ricalcolati | {warm_total / 1000:8.2f} s (restore {r_ms / 1000:.2f} s)")
-    print(f"\n  → Token risparmiati: {c_n - w_n:.0f} ({(1 - w_n / max(c_n, 1)) * 100:.0f}%)")
-    print(f"  → Speedup della ripresa: {c_ms / max(warm_total, 1):.1f}×")
-    print(f"  → KV-cache su disco: {kv_file_size_mb():.0f} MB")
+    print(f"  COLD resume: {c_n:7.0f} tokens recomputed | {c_ms / 1000:8.1f} s")
+    print(f"  WARM resume: {w_n:7.0f} tokens recomputed | {warm_total / 1000:8.2f} s (restore {r_ms / 1000:.2f} s)")
+    print(f"\n  → Tokens saved: {c_n - w_n:.0f} ({(1 - w_n / max(c_n, 1)) * 100:.0f}%)")
+    print(f"  → Resume speedup: {c_ms / max(warm_total, 1):.1f}×")
+    print(f"  → On-disk KV-cache: {kv_file_size_mb():.0f} MB")
     print("=" * 78)
 
-    with open("risultati_warm_start_kv_pro.json", "w") as f:
+    with open("warm_start_kv_pro_results.json", "w") as f:
         json.dump({"cold_ms": cold_ms, "cold_n": cold_n, "warm_ms": warm_ms,
                    "warm_n": warm_n, "restore_ms": restore_ms,
                    "kv_mb": kv_file_size_mb(), "reps": REPS}, f, indent=2)
-    print("\nSalvato in risultati_warm_start_kv_pro.json — mandamelo!")
+    print("\nSaved to warm_start_kv_pro_results.json")
 
 
 if __name__ == "__main__":

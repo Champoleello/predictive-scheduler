@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Esperimenti sui parametri dello scheduler (per il rapporto, §8.2)
+Experiments on the scheduler parameters (for the report, §8.2)
 =================================================================
 
-Due esperimenti, ognuno ripetuto su molte simulazioni con seed diversi:
+Two experiments, each repeated over many simulations with different seeds:
 
-  ESPERIMENTO A — Predittivo vs Reattivo
-    Confronta lo scheduler predittivo con un agente "ingenuo" che continua
-    finché non sbatte contro il rate limit (errore 429).
-    Misura: crash rate e token sprecati (cold start = re-invio del contesto).
+  EXPERIMENT A — Predictive vs Reactive
+    Compares the predictive scheduler with a "naive" agent that keeps going
+    until it slams into the rate limit (429 error).
+    Measures: crash rate and wasted tokens (cold start = re-sending the context).
 
-  ESPERIMENTO B — Sweep del fattore di sicurezza k
-    Fa variare k (quanto è prudente lo scheduler) e misura il trade-off:
-    k basso  → più passi completati ma rischio di crash;
-    k alto   → zero crash ma sospensioni premature (false positive).
+  EXPERIMENT B — Sweep of the safety factor k
+    Varies k (how conservative the scheduler is) and measures the trade-off:
+    low k  → more steps completed but crash risk;
+    high k → zero crashes but premature suspensions (false positives).
 
-Output: esperimenti_risultati.csv + grafici PNG.
+Output: experiment_results.csv + PNG charts.
 """
 
 import csv
@@ -27,12 +27,12 @@ from predictive_scheduler import (
     AgentState, MockBackend, PredictiveScheduler,
 )
 
-N_RUNS = 300          # simulazioni per configurazione
+N_RUNS = 300          # simulations per configuration
 MAX_STEPS = 60
 
 
 # ---------------------------------------------------------------------------
-# Simulazione di un run PREDITTIVO (scheduler v4)
+# Simulation of a PREDICTIVE run (scheduler v4)
 # ---------------------------------------------------------------------------
 
 def run_predictive(seed: int, budget: int, k: float):
@@ -44,14 +44,14 @@ def run_predictive(seed: int, budget: int, k: float):
         safety_factor_k=k,
     )
     state = AgentState(
-        task_description="task simulato",
-        messages=[{"role": "user", "content": "Esegui il task lungo simulato " * 5}],
+        task_description="simulated task",
+        messages=[{"role": "user", "content": "Run the long simulated task " * 5}],
     )
     crashed = False
     for _ in range(MAX_STEPS):
         d = scheduler.execute_step(state)
         if d["actual"] > 0 and d["actual"] > d["remaining"] + d["actual"]:
-            crashed = True  # non dovrebbe mai accadere
+            crashed = True  # should never happen
             break
         if d["action"] == "checkpoint":
             break
@@ -62,26 +62,26 @@ def run_predictive(seed: int, budget: int, k: float):
         "checkpointed": m["checkpoint"] > 0,
         "false_positive": m["false_positive_checkpoints"] > 0,
         "true_positive": m["true_positive_checkpoints"] > 0,
-        # token "sprecati" dal predittivo = budget residuo non usato alla sospensione
+        # tokens "wasted" by the predictive agent = unused remaining budget at suspension
         "wasted_tokens": scheduler.remaining_tokens if m["checkpoint"] else 0,
     }
 
 
 # ---------------------------------------------------------------------------
-# Simulazione di un run REATTIVO (baseline: nessuna previsione)
+# Simulation of a REACTIVE run (baseline: no prediction)
 # ---------------------------------------------------------------------------
 
 def run_reactive(seed: int, budget: int):
     random.seed(seed)
     backend = MockBackend(avg_tokens=320, name="std")
     remaining = budget
-    messages = [{"role": "user", "content": "Esegui il task lungo simulato " * 5}]
+    messages = [{"role": "user", "content": "Run the long simulated task " * 5}]
     steps, crashed, wasted = 0, False, 0
     for _ in range(MAX_STEPS):
-        remaining = max(0, remaining + random.randint(-100, 100))  # header simulati
+        remaining = max(0, remaining + random.randint(-100, 100))  # simulated headers
         response, actual = backend.generate(messages)
         if actual > remaining:
-            # CRASH 429 → cold start: l'intero contesto va re-inviato al riavvio
+            # 429 CRASH → cold start: the whole context must be re-sent on restart
             crashed = True
             wasted = sum(backend.estimate_tokens(m["content"]) for m in messages)
             break
@@ -92,7 +92,7 @@ def run_reactive(seed: int, budget: int):
 
 
 # ---------------------------------------------------------------------------
-# ESPERIMENTO A — Predittivo vs Reattivo (k = 2 fisso)
+# EXPERIMENT A — Predictive vs Reactive (fixed k = 2)
 # ---------------------------------------------------------------------------
 
 def experiment_a():
@@ -113,7 +113,7 @@ def experiment_a():
 
 
 # ---------------------------------------------------------------------------
-# ESPERIMENTO B — Sweep di k (budget = 6500 fisso)
+# EXPERIMENT B — Sweep of k (fixed budget = 6500)
 # ---------------------------------------------------------------------------
 
 def experiment_b():
@@ -135,7 +135,7 @@ def experiment_b():
 
 
 # ---------------------------------------------------------------------------
-# Grafici e CSV
+# Charts and CSV
 # ---------------------------------------------------------------------------
 
 def make_charts(rows_a, rows_b):
@@ -143,35 +143,35 @@ def make_charts(rows_a, rows_b):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # --- Grafico A: crash rate predittivo vs reattivo ---
+    # --- Chart A: predictive vs reactive crash rate ---
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
     budgets = [r["budget"] for r in rows_a]
     x = range(len(budgets))
     w = 0.35
     ax1.bar([i - w/2 for i in x], [r["reac_crash_rate"]*100 for r in rows_a], w,
-            label="Reattivo (baseline)", color="#d9534f")
+            label="Reactive (baseline)", color="#d9534f")
     ax1.bar([i + w/2 for i in x], [r["pred_crash_rate"]*100 for r in rows_a], w,
-            label="Predittivo (v4)", color="#5cb85c")
+            label="Predictive (v4)", color="#5cb85c")
     ax1.set_xticks(list(x)); ax1.set_xticklabels(budgets)
-    ax1.set_xlabel("Budget iniziale (token)"); ax1.set_ylabel("Crash rate (%)")
-    ax1.set_title("Crash 429: predittivo vs reattivo"); ax1.legend()
+    ax1.set_xlabel("Initial budget (tokens)"); ax1.set_ylabel("Crash rate (%)")
+    ax1.set_title("429 crashes: predictive vs reactive"); ax1.legend()
 
     ax2.bar([i - w/2 for i in x], [r["reac_avg_waste"] for r in rows_a], w,
-            label="Reattivo (cold start)", color="#d9534f")
+            label="Reactive (cold start)", color="#d9534f")
     ax2.bar([i + w/2 for i in x], [r["pred_avg_waste"] for r in rows_a], w,
-            label="Predittivo (margine non usato)", color="#5cb85c")
+            label="Predictive (unused margin)", color="#5cb85c")
     ax2.set_xticks(list(x)); ax2.set_xticklabels(budgets)
-    ax2.set_xlabel("Budget iniziale (token)"); ax2.set_ylabel("Token sprecati (media)")
-    ax2.set_title("Spreco di token per run"); ax2.legend()
+    ax2.set_xlabel("Initial budget (tokens)"); ax2.set_ylabel("Wasted tokens (mean)")
+    ax2.set_title("Token waste per run"); ax2.legend()
     fig.tight_layout()
-    fig.savefig("grafico_A_predittivo_vs_reattivo.png", dpi=150)
+    fig.savefig("chart_A_predictive_vs_reactive.png", dpi=150)
 
-    # --- Grafico B: effetto del fattore di sicurezza k ---
+    # --- Chart B: effect of the safety factor k ---
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
     ks = [r["k"] for r in rows_b]
-    ax1.plot(ks, [r["avg_steps"] for r in rows_b], "o-", color="#337ab7", label="Passi completati (media)")
-    ax1.set_xlabel("Fattore di sicurezza k"); ax1.set_ylabel("Passi completati")
-    ax1.set_title("k vs produttività"); ax1.grid(alpha=0.3); ax1.legend()
+    ax1.plot(ks, [r["avg_steps"] for r in rows_b], "o-", color="#337ab7", label="Steps completed (mean)")
+    ax1.set_xlabel("Safety factor k"); ax1.set_ylabel("Steps completed")
+    ax1.set_title("k vs productivity"); ax1.grid(alpha=0.3); ax1.legend()
 
     ax2.plot(ks, [(r["precision"] or 0)*100 for r in rows_b], "o-",
              color="#5cb85c", label="Suspension precision (%)")
@@ -179,43 +179,43 @@ def make_charts(rows_a, rows_b):
              color="#f0ad4e", label="False positive rate (%)")
     ax2.plot(ks, [r["crash_rate"]*100 for r in rows_b], "^:",
              color="#d9534f", label="Crash rate (%)")
-    ax2.set_xlabel("Fattore di sicurezza k"); ax2.set_ylabel("%")
-    ax2.set_title("k vs qualità delle sospensioni"); ax2.grid(alpha=0.3); ax2.legend()
+    ax2.set_xlabel("Safety factor k"); ax2.set_ylabel("%")
+    ax2.set_title("k vs suspension quality"); ax2.grid(alpha=0.3); ax2.legend()
     fig.tight_layout()
-    fig.savefig("grafico_B_sweep_k.png", dpi=150)
+    fig.savefig("chart_B_sweep_k.png", dpi=150)
 
 
 def save_csv(rows_a, rows_b):
-    with open("esperimenti_risultati.csv", "w", newline="") as f:
+    with open("experiment_results.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ESPERIMENTO A — Predittivo vs Reattivo (k=2)"])
+        w.writerow(["EXPERIMENT A — Predictive vs Reactive (k=2)"])
         w.writerow(rows_a[0].keys())
         for r in rows_a:
             w.writerow(r.values())
         w.writerow([])
-        w.writerow(["ESPERIMENTO B — Sweep di k (budget=6500)"])
+        w.writerow(["EXPERIMENT B — Sweep of k (budget=6500)"])
         w.writerow(rows_b[0].keys())
         for r in rows_b:
             w.writerow(r.values())
 
 
 if __name__ == "__main__":
-    print(f"Eseguo {N_RUNS} simulazioni per configurazione...")
+    print(f"Running {N_RUNS} simulations per configuration...")
     rows_a = experiment_a()
     rows_b = experiment_b()
     save_csv(rows_a, rows_b)
     make_charts(rows_a, rows_b)
 
-    print("\n=== ESPERIMENTO A — Predittivo vs Reattivo (k=2) ===")
+    print("\n=== EXPERIMENT A — Predictive vs Reactive (k=2) ===")
     for r in rows_a:
-        print(f"budget {r['budget']:5d} | crash: reattivo {r['reac_crash_rate']:5.1%} vs predittivo {r['pred_crash_rate']:5.1%}"
-              f" | spreco medio: {r['reac_avg_waste']:6.0f} vs {r['pred_avg_waste']:6.0f} token")
+        print(f"budget {r['budget']:5d} | crash: reactive {r['reac_crash_rate']:5.1%} vs predictive {r['pred_crash_rate']:5.1%}"
+              f" | mean waste: {r['reac_avg_waste']:6.0f} vs {r['pred_avg_waste']:6.0f} tokens")
 
-    print("\n=== ESPERIMENTO B — Sweep di k (budget=6500) ===")
+    print("\n=== EXPERIMENT B — Sweep of k (budget=6500) ===")
     for r in rows_b:
         p = f"{r['precision']:.0%}" if r['precision'] is not None else "n/a"
         fp = f"{r['false_positive_rate']:.0%}" if r['false_positive_rate'] is not None else "n/a"
-        print(f"k={r['k']:.1f} | passi medi: {r['avg_steps']:5.1f} | crash: {r['crash_rate']:5.1%}"
+        print(f"k={r['k']:.1f} | mean steps: {r['avg_steps']:5.1f} | crash: {r['crash_rate']:5.1%}"
               f" | precision: {p} | false positive: {fp}")
 
-    print("\nFile generati: esperimenti_risultati.csv, grafico_A_predittivo_vs_reattivo.png, grafico_B_sweep_k.png")
+    print("\nFiles generated: experiment_results.csv, chart_A_predictive_vs_reactive.png, chart_B_sweep_k.png")

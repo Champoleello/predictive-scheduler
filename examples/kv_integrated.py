@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-SCHEDULER + KV-CHECKPOINT INTEGRATO — il sistema completo
+SCHEDULER + INTEGRATED KV-CHECKPOINT — the complete system
 ==========================================================
 
-Fin qui avevamo due pezzi dimostrati separatamente:
-  • lo scheduler predittivo che DECIDE quando fermarsi (v4, Groq)
-  • il warm start vero via KV-cache su disco (warm_start_kv)
+Up to now we had two pieces demonstrated separately:
+  • the predictive scheduler that DECIDES when to stop (v4, Groq)
+  • true warm start via on-disk KV-cache (warm_start_kv)
 
-Questo file li unisce: quando lo scheduler decide "checkpoint", salva in
-un'UNICA TRANSAZIONE sia lo stato logico (messaggi, passi, idempotenza)
-sia la KV-cache del modello. Alla ripresa ripristina entrambi: l'agente
-riparte dal passo esatto E il modello non ricalcola il prefill.
+This file joins them: when the scheduler decides "checkpoint", it saves in
+a SINGLE TRANSACTION both the logical state (messages, steps, idempotency)
+and the model's KV-cache. On resume it restores both: the agent restarts
+from the exact step AND the model does not recompute the prefill.
 
-    decisione (§4) ──► checkpoint ──► [ KV-cache su disco + stato JSON ]
+    decision (§4) ──► checkpoint ──► [ KV-cache on disk + JSON state ]
                                             │
-    rilancio ──► restore KV + stato ──► riprende a costo ~zero
+    relaunch ──► restore KV + state ──► resumes at ~zero cost
 
-Nota di design emersa: con il KV-checkpoint, le azioni che MODIFICANO la
-storia (compress/summarize, §5.1–5.2) invalidano la cache del prefisso.
-In questa versione l'escalation salta quindi direttamente al checkpoint:
-il costo della sospensione è ormai così basso (≈decine di ms) che
-sospendere è più economico che comprimere.
+Design note that emerged: with the KV-checkpoint, actions that MODIFY the
+history (compress/summarize, §5.1–5.2) invalidate the prefix cache.
+In this version the escalation therefore jumps straight to checkpoint:
+suspension is now so cheap (≈tens of ms) that suspending costs less
+than compressing.
 
-Prerequisito: llama-server attivo (avviato da avvia_warm_start_kv_pro.command).
-Il rate limit è simulato (in locale non esiste): il budget parte basso e
-cala a ogni passo, per far scattare il checkpoint a metà task.
+Prerequisite: a running llama-server (started by start_warm_start_kv_pro.command).
+The rate limit is simulated (none exists locally): the budget starts low and
+shrinks each step, so the checkpoint triggers mid-task.
 """
 
 import json
@@ -36,7 +36,7 @@ import uuid
 try:
     import requests
 except ImportError:
-    print("Manca 'requests'. Esegui: pip3 install requests")
+    print("'requests' is missing. Run: pip3 install requests")
     sys.exit(1)
 
 import os as _os, sys as _sys
@@ -44,12 +44,12 @@ _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 
 from predictive_scheduler import AgentState, BaseLLMBackend, PredictiveScheduler
 
 SERVER = "http://127.0.0.1:8080"
-KV_FILE = "agente_kv_integrato.bin"
-CHECKPOINT_FILE = "checkpoint_integrato.json"
+KV_FILE = "agent_kv_integrated.bin"
+CHECKPOINT_FILE = "checkpoint_integrated.json"
 
 
 # =============================================================================
-# 1. BACKEND llama-server (chat template ufficiale + slot 0)
+# 1. llama-server BACKEND (official chat template + slot 0)
 # =============================================================================
 
 class LlamaServerBackend(BaseLLMBackend):
@@ -75,10 +75,10 @@ class LlamaServerBackend(BaseLLMBackend):
         r.raise_for_status()
         d = r.json()
         t = d.get("timings", {})
-        self.last_prompt_n = t.get("prompt_n", 0)      # token di prefill ricalcolati
+        self.last_prompt_n = t.get("prompt_n", 0)      # recomputed prefill tokens
         self.last_prompt_ms = t.get("prompt_ms", 0)
         content = d.get("content", "")
-        # togli il thinking dalla storia (resta solo la risposta finale)
+        # strip the thinking from the history (only the final answer remains)
         if "</think>" in content:
             content = content.split("</think>")[-1]
         tokens = t.get("prompt_n", 0) + t.get("predicted_n", 0)
@@ -89,29 +89,29 @@ class LlamaServerBackend(BaseLLMBackend):
 
 
 # =============================================================================
-# 2. SCHEDULER CON KV-CHECKPOINT TRANSAZIONALE
+# 2. SCHEDULER WITH TRANSACTIONAL KV-CHECKPOINT
 # =============================================================================
 
 class KVCheckpointScheduler(PredictiveScheduler):
 
     def _base_estimate(self, messages):
-        # Stima tarata su questo workload (risposte brevi, /no_think):
-        # input completo + ~260 token di generazione attesa.
+        # Estimate tuned for this workload (short answers, /no_think):
+        # full input + ~260 tokens of expected generation.
         input_tokens = sum(self.backend.estimate_tokens(m["content"]) for m in messages)
         return input_tokens + 260
 
     def decide_and_apply(self, state, estimated, context_tokens):
-        # Niente compress/summarize: invaliderebbero la KV-cache del prefisso.
-        # Con il warm start vero, sospendere costa meno che comprimere.
+        # No compress/summarize: they would invalidate the prefix KV-cache.
+        # With true warm start, suspending costs less than compressing.
         return "checkpoint" if self.should_checkpoint(estimated) else "continue"
 
-    # ---- ciclo di vita della KV: memoria SEMI-TEMPORANEA ------------------
-    # Il blob KV è un acceleratore, non la verità (quella è il manifest JSON):
-    # può quindi essere cancellato aggressivamente. Regole:
-    #   save     → nuovo blob, cancella il precedente (max 1 su disco)
-    #   restore  → blob marcato "consumato"
-    #   1° passo riuscito post-ripresa → blob consumato cancellato
-    #   task completato / blob orfani → pulizia totale
+    # ---- KV lifecycle: SEMI-TEMPORARY memory -------------------------------
+    # The KV blob is an accelerator, not the truth (that is the JSON manifest):
+    # it can therefore be deleted aggressively. Rules:
+    #   save     → new blob, delete the previous one (max 1 on disk)
+    #   restore  → blob marked "consumed"
+    #   1st successful step after resume → consumed blob deleted
+    #   task completed / orphan blobs → full cleanup
     _consumed_kv: str = ""
     _current_kv: str = ""
 
@@ -124,33 +124,33 @@ class KVCheckpointScheduler(PredictiveScheduler):
             if name and os.path.exists(self._kv_path(name)):
                 mb = os.path.getsize(self._kv_path(name)) / 1e6
                 os.remove(self._kv_path(name))
-                print(f"  ♻ KV '{name}' cancellata ({mb:.0f} MB liberati — {reason})")
+                print(f"  ♻ KV '{name}' deleted ({mb:.0f} MB freed — {reason})")
         except OSError:
             pass
 
     def gc_consumed_kv(self):
-        """Da chiamare dopo il primo passo riuscito post-ripresa."""
+        """Call after the first successful step following a resume."""
         if self._consumed_kv:
-            self._delete_kv(self._consumed_kv, "consumata dopo la ripresa")
+            self._delete_kv(self._consumed_kv, "consumed after resume")
             self._consumed_kv = ""
 
     def gc_orphans(self):
-        """All'avvio: elimina blob non referenziati dal manifest corrente."""
+        """On startup: delete blobs not referenced by the current manifest."""
         referenced = self._current_kv
         if os.path.isdir("kv_cache"):
             for f_ in os.listdir("kv_cache"):
-                if f_.startswith("agente_kv_") and f_ != referenced:
-                    self._delete_kv(f_, "blob orfano")
+                if f_.startswith("agent_kv_") and f_ != referenced:
+                    self._delete_kv(f_, "orphan blob")
 
-    # ---- transazione: prima la KV, poi lo stato logico (commit) ----------
+    # ---- transaction: KV first, then the logical state (commit) ----------
     def save_checkpoint_kv(self, state: AgentState) -> dict:
         t0 = time.time()
         cp_id = uuid.uuid4().hex
-        new_kv = f"agente_kv_{cp_id[:8]}.bin"
+        new_kv = f"agent_kv_{cp_id[:8]}.bin"
         r = requests.post(f"{SERVER}/slots/0?action=save",
                           json={"filename": new_kv}, timeout=1800)
         r.raise_for_status()
-        kv_info = r.json()                       # contiene n_saved
+        kv_info = r.json()                       # contains n_saved
         data = {
             "checkpoint_id": cp_id,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -164,15 +164,15 @@ class KVCheckpointScheduler(PredictiveScheduler):
                 "idempotency_keys": state.idempotency_keys,
             },
         }
-        tmp = CHECKPOINT_FILE + ".tmp"           # scrittura atomica:
-        with open(tmp, "w") as f:                # se il salvataggio KV fallisce,
-            json.dump(data, f, indent=2)         # il vecchio checkpoint resta valido
+        tmp = CHECKPOINT_FILE + ".tmp"           # atomic write:
+        with open(tmp, "w") as f:                # if the KV save fails,
+            json.dump(data, f, indent=2)         # the old checkpoint stays valid
         os.replace(tmp, CHECKPOINT_FILE)
-        # solo DOPO il commit del manifest, il vecchio blob diventa obsoleto
+        # only AFTER the manifest commit does the old blob become obsolete
         old = self._current_kv
         self._current_kv = new_kv
         if old and old != new_kv:
-            self._delete_kv(old, "sostituita dal nuovo checkpoint")
+            self._delete_kv(old, "replaced by the new checkpoint")
         ms = (time.time() - t0) * 1000
         return {"ms": ms, "n_saved": kv_info.get("n_saved", 0)}
 
@@ -190,10 +190,10 @@ class KVCheckpointScheduler(PredictiveScheduler):
             r.raise_for_status()
             n = r.json().get("n_restored", 0)
             info = {"kv_restored": n == data.get("kv_n_saved", -1), "n_restored": n}
-            self._consumed_kv = data["kv_file"]   # semi-temporanea: marcata consumata
+            self._consumed_kv = data["kv_file"]   # semi-temporary: marked consumed
             self._current_kv = ""
         except Exception as e:
-            print(f"  (restore KV fallito: {e} → proseguo con warm start logico)")
+            print(f"  (KV restore failed: {e} → continuing with logical warm start)")
         s = data["state"]
         state = AgentState(step=s["step"], messages=s["messages"],
                            total_tokens_used=s["total_tokens_used"],
@@ -203,73 +203,73 @@ class KVCheckpointScheduler(PredictiveScheduler):
 
 
 # =============================================================================
-# 3. DEMO — task multi-passo con checkpoint a metà e ripresa a costo ~zero
+# 3. DEMO — multi-step task with a mid-task checkpoint and ~zero-cost resume
 # =============================================================================
 
 QUESTIONS = [
-    "Elenca i 3 rischi principali di un agente LLM senza gestione delle risorse.",
-    "Per ciascun rischio, indica una metrica per misurarlo.",
-    "Qual è il rischio più urgente dei tre? Motiva confrontando le metriche.",
-    "Proponi una politica di mitigazione per il rischio più urgente.",
-    "Che ruolo ha la KV-cache nella ripresa di un agente sospeso?",
-    "Riassumi tutta la conversazione in 3 punti.",
+    "List the 3 main risks of an LLM agent without resource management.",
+    "For each risk, give one metric to measure it.",
+    "Which of the three risks is most urgent? Justify by comparing the metrics.",
+    "Propose a mitigation policy for the most urgent risk.",
+    "What role does the KV-cache play in resuming a suspended agent?",
+    "Summarize the whole conversation in 3 bullet points.",
 ]
 
 
 def main():
     print("=" * 78)
-    print("  SCHEDULER PREDITTIVO + KV-CHECKPOINT — sistema integrato")
+    print("  PREDICTIVE SCHEDULER + KV-CHECKPOINT — integrated system")
     print("=" * 78)
 
     try:
         requests.get(f"{SERVER}/health", timeout=5).raise_for_status()
     except Exception:
-        print("ERRORE: llama-server non attivo. Avvialo con avvia_warm_start_kv_pro.command")
+        print("ERROR: llama-server is not running. Start it first (see docs).")
         sys.exit(1)
 
     backend = LlamaServerBackend()
     scheduler = KVCheckpointScheduler(
         backend=backend,
-        initial_remaining_tokens=1200,   # budget SIMULATO basso: forza il checkpoint a metà task
+        initial_remaining_tokens=1200,   # SIMULATED low budget: forces a mid-task checkpoint
         safety_factor_k=2.0,
     )
 
     state, info = scheduler.load_checkpoint_kv()
     if state:
-        scheduler.remaining_tokens = 1200           # finestra "resettata"
-        print(f"↻ RIPRESA dal passo {state.step + 1} | KV ripristinata: "
-              f"{'sì, ' + str(info['n_restored']) + ' celle' if info['kv_restored'] else 'NO (fallback logico)'}")
+        scheduler.remaining_tokens = 1200           # window "has reset"
+        print(f"↻ RESUMED from step {state.step + 1} | KV restored: "
+              f"{'yes, ' + str(info['n_restored']) + ' cells' if info['kv_restored'] else 'NO (logical fallback)'}")
     else:
         state = AgentState(
-            task_description="Analisi dei rischi di un agente LLM autonomo",
+            task_description="Risk analysis of an autonomous LLM agent",
             messages=[{"role": "system",
-                       "content": "Rispondi in italiano, conciso (max 100 parole). /no_think"}],
+                       "content": "Answer concisely (max 100 words). /no_think"}],
         )
 
     while state.step < len(QUESTIONS):
         state.add_message("user", QUESTIONS[state.step])
         d = scheduler.execute_step(state)
         prefill = getattr(backend, "last_prompt_n", "?")
-        print(f"Passo {d['step']:2d} | budget(sim): {d['remaining']:5d} | "
-              f"prefill ricalcolato: {prefill:>5} tok | {d['action'].upper()}")
+        print(f"Step {d['step']:2d} | budget(sim): {d['remaining']:5d} | "
+              f"recomputed prefill: {prefill:>5} tok | {d['action'].upper()}")
 
         if d["action"] != "checkpoint":
-            # primo passo riuscito dopo la ripresa → la KV consumata si può cancellare
+            # first successful step after resume → the consumed KV can be deleted
             scheduler.gc_consumed_kv()
 
         if d["action"] == "checkpoint":
-            state.messages.pop()   # la domanda non risposta verrà ri-aggiunta alla ripresa
+            state.messages.pop()   # the unanswered question will be re-added on resume
             info = scheduler.save_checkpoint_kv(state)
-            print(f"\n🛑 CHECKPOINT TRANSAZIONALE: stato logico + KV-cache "
-                  f"({info['n_saved']} celle) salvati in {info['ms']:.0f} ms")
-            print("   Rilancia questo script: riprenderà dal passo esatto SENZA re-prefill.")
+            print(f"\n🛑 TRANSACTIONAL CHECKPOINT: logical state + KV-cache "
+                  f"({info['n_saved']} cells) saved in {info['ms']:.0f} ms")
+            print("   Run this script again: it will resume from the exact step WITHOUT re-prefill.")
             return
 
     print("-" * 78)
-    print(f"✅ Task completato in {state.step} passi | token usati: {state.total_tokens_used}")
-    # pulizia totale: manifest + eventuali blob KV residui
-    scheduler._delete_kv(scheduler._current_kv, "task completato")
-    scheduler._delete_kv(scheduler._consumed_kv, "task completato")
+    print(f"✅ Task completed in {state.step} steps | tokens used: {state.total_tokens_used}")
+    # full cleanup: manifest + any leftover KV blobs
+    scheduler._delete_kv(scheduler._current_kv, "task completed")
+    scheduler._delete_kv(scheduler._consumed_kv, "task completed")
     if os.path.exists(CHECKPOINT_FILE):
         os.remove(CHECKPOINT_FILE)
 

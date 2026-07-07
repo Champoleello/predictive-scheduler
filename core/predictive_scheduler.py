@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-Predictive Resource-Aware Scheduler v4 — Allineato al Rapporto di Ricerca v1.0
+Predictive Resource-Aware Scheduler v4 — aligned with the research report v1.0
 ==============================================================================
 
-Questa versione implementa FEDELMENTE ciò che il rapporto promette:
+This version faithfully implements what the report promises:
 
-  §4  Formalizzazione matematica:
+  §4  Mathematical formalization:
       - T_estimated = T_input + max_tokens + tool_overhead + ε
-        dove ε deriva da MEDIE MOBILI degli errori di stima passati (non rumore casuale)
-      - σ = deviazione standard dei consumi reali osservati
-      - Regola checkpoint: T_remaining < T_estimated + k·σ
-      - Risk(state) = w1·(T_est/T_rem) + w2·(C_ctx/C_max) + w3·(costo_stimato/budget_residuo)
+        where ε comes from MOVING AVERAGES of past estimation errors (not random noise)
+      - σ = standard deviation of the observed real consumption
+      - Checkpoint rule: T_remaining < T_estimated + k·σ
+      - Risk(state) = w1·(T_est/T_rem) + w2·(C_ctx/C_max) + w3·(estimated_cost/remaining_budget)
 
-  §5  Politica decisionale estesa (scala di escalation, ESEGUITA davvero):
-      1. compress     → comprime gli output dei tool più vecchi
-      2. summarize    → sostituisce la storia vecchia con un riassunto
-      3. model_switch → passa a un modello più economico
-      4. checkpoint   → salvataggio graceful e sospensione
+  §5  Extended decision policy (escalation ladder, actually EXECUTED):
+      1. compress     → compresses the oldest tool outputs
+      2. summarize    → replaces old history with a summary
+      3. model_switch → switches to a cheaper model
+      4. checkpoint   → graceful save and suspension
 
-  §3.1 Serializzazione sensibile agli effetti collaterali:
-      - checkpoint JSON con checkpoint_id, chiavi di idempotenza e timestamp
+  §3.1 Side-effect-aware serialization:
+      - JSON checkpoint with checkpoint_id, idempotency keys and timestamp
 
-  §8.2 Metriche del prototipo:
+  §8.2 Prototype metrics:
       - suspension precision, false positive rate, token waste avoided, recovery info
+
+NOTE: the demo at the bottom of this file uses MockBackend — SIMULATED numbers
+for illustration only. Real, reproducible results live in experiments/.
 """
 
 import json
@@ -41,7 +44,7 @@ except ImportError:
 
 
 # =============================================================================
-# 1. STATO DELL'AGENTE
+# 1. AGENT STATE
 # =============================================================================
 
 @dataclass
@@ -50,7 +53,7 @@ class AgentState:
     messages: List[Dict[str, str]] = field(default_factory=list)
     total_tokens_used: int = 0
     task_description: str = ""
-    # §3.1 — chiavi di idempotenza: una per ogni passo con effetti collaterali
+    # §3.1 — idempotency keys: one per step with side effects
     idempotency_keys: List[str] = field(default_factory=list)
 
     def add_message(self, role: str, content: str):
@@ -58,7 +61,7 @@ class AgentState:
 
 
 # =============================================================================
-# 2. LLM BACKENDS (invariati dalla v3)
+# 2. LLM BACKENDS (unchanged from v3)
 # =============================================================================
 
 class BaseLLMBackend:
@@ -72,7 +75,11 @@ class BaseLLMBackend:
 
 
 class MockBackend(BaseLLMBackend):
-    """Backend simulato (veloce, per testare lo scheduler)."""
+    """Simulated backend (fast, for exercising the scheduler).
+
+    Returns canned replies and RANDOM token counts — for demos and tests only.
+    For real measurements see experiments/.
+    """
 
     def __init__(self, avg_tokens: int = 320, name: str = "mock-standard"):
         self.avg_tokens = avg_tokens
@@ -80,7 +87,7 @@ class MockBackend(BaseLLMBackend):
 
     def generate(self, messages, max_tokens=600, temperature=0.6):
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        response = f"[{self.name}] Analizzato: {last[:60]}... Procedo col passo successivo."
+        response = f"[{self.name}] Analyzed: {last[:60]}... Proceeding to the next step."
         tokens = int(self.avg_tokens * random.uniform(0.75, 1.35))
         return response, min(tokens, max_tokens)
 
@@ -89,11 +96,11 @@ class MockBackend(BaseLLMBackend):
 
 
 class LiteLLMBackend(BaseLLMBackend):
-    """Backend reale via LiteLLM (Ollama, OpenAI, Anthropic, Groq, ...)."""
+    """Real backend via LiteLLM (Ollama, OpenAI, Anthropic, Groq, ...)."""
 
     def __init__(self, model: str = "ollama/llama3.2", api_key: Optional[str] = None):
         if not LITELLM_AVAILABLE:
-            raise ImportError("LiteLLM non è installato. Esegui: pip install litellm")
+            raise ImportError("LiteLLM is not installed. Run: pip install litellm")
         self.model = model
         self.name = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
@@ -108,8 +115,8 @@ class LiteLLMBackend(BaseLLMBackend):
             tokens = response.usage.total_tokens if response.usage else self.estimate_tokens(content)
             return content.strip(), tokens
         except Exception as e:
-            print(f"[LiteLLMBackend] Errore: {e}")
-            return f"[Errore LiteLLM] {str(e)[:100]}", 50
+            print(f"[LiteLLMBackend] Error: {e}")
+            return f"[LiteLLM error] {str(e)[:100]}", 50
 
     def estimate_tokens(self, text: str) -> int:
         try:
@@ -119,22 +126,22 @@ class LiteLLMBackend(BaseLLMBackend):
 
 
 # =============================================================================
-# 3. PREDICTIVE SCHEDULER v4 — fedele a §4 e §5 del rapporto
+# 3. PREDICTIVE SCHEDULER v4 — faithful to §4 and §5 of the report
 # =============================================================================
 
-MAX_TOKENS_OUT = 650      # max_tokens della prossima chiamata
-TOOL_OVERHEAD = 280       # overhead stimato dei tool
+MAX_TOKENS_OUT = 650      # max_tokens of the next call
+TOOL_OVERHEAD = 280       # estimated tool overhead
 
 
 class PredictiveScheduler:
     def __init__(
         self,
         backend: BaseLLMBackend,
-        economy_backend: Optional[BaseLLMBackend] = None,   # per il model-switch (§5.3)
+        economy_backend: Optional[BaseLLMBackend] = None,   # for the model switch (§5.3)
         initial_remaining_tokens: int = 7000,
         safety_factor_k: float = 2.0,
         context_limit: int = 128_000,
-        budget_total_tokens: int = 50_000,                   # budget economico (§4, termine w3)
+        budget_total_tokens: int = 50_000,                   # economic budget (§4, w3 term)
         weights: Tuple[float, float, float] = (0.55, 0.20, 0.25),  # w1, w2, w3
         seed: Optional[int] = None,
     ):
@@ -149,39 +156,39 @@ class PredictiveScheduler:
         self.budget_used = 0
         self.w1, self.w2, self.w3 = weights
 
-        # §4 — storici per ε e σ
-        self.historical_consumption: List[int] = []   # consumi reali
-        self.estimation_errors: List[int] = []        # errore = reale - stima_base
+        # §4 — history for ε and σ
+        self.historical_consumption: List[int] = []   # real consumption
+        self.estimation_errors: List[int] = []        # error = real - base_estimate
 
-        # §8.2 — metriche
+        # §8.2 — metrics
         self.metrics = {
             "steps": 0, "continue": 0, "compress": 0, "summarize": 0,
             "model_switch": 0, "checkpoint": 0,
-            "true_positive_checkpoints": 0,   # checkpoint che ha davvero evitato un crash
-            "false_positive_checkpoints": 0,  # sospensione inutile
-            "would_have_crashed": 0,          # passi in cui senza scheduler → 429
-            "tokens_saved_compress": 0,       # token risparmiati dalla compressione
-            "tokens_saved_summarize": 0,      # token risparmiati dalla summarization
+            "true_positive_checkpoints": 0,   # checkpoint that actually avoided a crash
+            "false_positive_checkpoints": 0,  # unnecessary suspension
+            "would_have_crashed": 0,          # steps where, without the scheduler → 429
+            "tokens_saved_compress": 0,       # tokens saved by compression
+            "tokens_saved_summarize": 0,      # tokens saved by summarization
         }
 
         if seed is not None:
             random.seed(seed)
 
-    # ---------------- Telemetria (simulata: header del provider) ----------------
+    # ---------------- Telemetry (simulated: provider headers) ----------------
 
     def simulate_provider_headers(self):
         noise = random.randint(-100, 100)
         current = max(0, self.remaining_tokens + noise)
         return {"x-ratelimit-remaining-tokens": current}
 
-    # ---------------- §4: stima con ε da medie mobili ----------------
+    # ---------------- §4: estimation with moving-average ε ----------------
 
     def _base_estimate(self, messages: List[Dict]) -> int:
         input_tokens = sum(self.backend.estimate_tokens(m["content"]) for m in messages)
         return input_tokens + MAX_TOKENS_OUT + TOOL_OVERHEAD
 
     def epsilon(self) -> int:
-        """ε = media mobile degli errori di stima degli ultimi 6 passi (§4)."""
+        """ε = moving average of the estimation errors over the last 6 steps (§4)."""
         if not self.estimation_errors:
             return 0
         window = self.estimation_errors[-6:]
@@ -191,14 +198,14 @@ class PredictiveScheduler:
         return max(200, self._base_estimate(messages) + self.epsilon())
 
     def sigma(self, fallback_estimate: int) -> float:
-        """σ = deviazione standard dei consumi reali osservati (§4)."""
+        """σ = standard deviation of the observed real consumption (§4)."""
         h = self.historical_consumption
         if len(h) >= 4:
             mean = sum(h) / len(h)
             return (sum((x - mean) ** 2 for x in h) / len(h)) ** 0.5
-        return fallback_estimate * 0.28  # prudente finché non c'è storia
+        return fallback_estimate * 0.28  # conservative until there is history
 
-    # ---------------- §4: regola di checkpoint e funzione di rischio ----------------
+    # ---------------- §4: checkpoint rule and risk function ----------------
 
     def should_checkpoint(self, estimated_cost: int) -> bool:
         margin = self.safety_factor_k * self.sigma(estimated_cost)
@@ -212,10 +219,10 @@ class PredictiveScheduler:
             + self.w3 * (estimated_cost / budget_remaining)
         )
 
-    # ---------------- §5: azioni della politica estesa (ESEGUITE davvero) ----------------
+    # ---------------- §5: actions of the extended policy (actually EXECUTED) ----------------
 
     def compress_tool_outputs(self, state: AgentState) -> int:
-        """§5.1 — comprime i messaggi assistant più vecchi (tranne gli ultimi 3)."""
+        """§5.1 — compresses the oldest assistant messages (except the last 3)."""
         saved = 0
         for m in state.messages[:-3]:
             if m["role"] == "assistant" and len(m["content"]) > 120:
@@ -224,18 +231,18 @@ class PredictiveScheduler:
         return saved
 
     def summarize_history(self, state: AgentState) -> int:
-        """§5.2 — garbage collection semantica: sostituisce la storia vecchia con un riassunto."""
+        """§5.2 — semantic garbage collection: replaces old history with a summary."""
         if len(state.messages) <= 4:
             return 0
         old = state.messages[:-3]
         before = sum(self.backend.estimate_tokens(m["content"]) for m in old)
-        summary = (f"[RIASSUNTO dei primi {len(old)} messaggi] Task: {state.task_description}. "
-                   f"Completati {state.step} passi; risultati intermedi conservati nel checkpoint.")
+        summary = (f"[SUMMARY of the first {len(old)} messages] Task: {state.task_description}. "
+                   f"Completed {state.step} steps; intermediate results kept in the checkpoint.")
         state.messages = [{"role": "system", "content": summary}] + state.messages[-3:]
         return max(0, before - self.backend.estimate_tokens(summary))
 
     def switch_model(self) -> bool:
-        """§5.3 — passa al modello economico, se disponibile e non già fatto."""
+        """§5.3 — switches to the economy model, if available and not already done."""
         if self.economy_backend and not self.switched:
             self.backend = self.economy_backend
             self.switched = True
@@ -244,19 +251,19 @@ class PredictiveScheduler:
 
     def decide_and_apply(self, state: AgentState, estimated: int, context_tokens: int) -> str:
         """
-        §5 — Scala di escalation: prova le azioni in ordine e si ferma
-        appena la regola di sicurezza (§4) è di nuovo soddisfatta.
+        §5 — Escalation ladder: tries the actions in order and stops
+        as soon as the safety rule (§4) is satisfied again.
         """
         if not self.should_checkpoint(estimated):
             return "continue"
 
-        # 1) Compressione output tool
+        # 1) Tool-output compression
         self.metrics["tokens_saved_compress"] += self.compress_tool_outputs(state)
         estimated = self.estimate_next_step_cost(state.messages)
         if not self.should_checkpoint(estimated):
             return "compress"
 
-        # 2) Summarization selettiva
+        # 2) Selective summarization
         self.metrics["tokens_saved_summarize"] += self.summarize_history(state)
         estimated = self.estimate_next_step_cost(state.messages)
         if not self.should_checkpoint(estimated):
@@ -271,7 +278,7 @@ class PredictiveScheduler:
         # 4) Graceful checkpoint
         return "checkpoint"
 
-    # ---------------- Ciclo di esecuzione ----------------
+    # ---------------- Execution loop ----------------
 
     def execute_step(self, state: AgentState):
         headers = self.simulate_provider_headers()
@@ -286,7 +293,7 @@ class PredictiveScheduler:
         self.metrics[action] += 1
 
         if action == "checkpoint":
-            # §8.2 — il checkpoint era necessario? (verifica col costo che si sarebbe realizzato)
+            # §8.2 — was the checkpoint necessary? (checked against the cost that would have occurred)
             base = self._base_estimate(state.messages)
             hypothetical = int(base * random.uniform(0.85, 1.15))
             if hypothetical > self.remaining_tokens:
@@ -297,14 +304,14 @@ class PredictiveScheduler:
                     "estimated": estimated, "actual": 0, "action": action,
                     "risk": round(risk, 3), "model": self.backend.name}
 
-        # Chiamata al modello (reale o mock)
+        # Model call (real or mock)
         response, actual = self.backend.generate(state.messages, max_tokens=MAX_TOKENS_OUT)
 
-        # §8.2 — senza scheduler, questo passo avrebbe causato un 429?
+        # §8.2 — without the scheduler, would this step have caused a 429?
         if actual > self.remaining_tokens:
             self.metrics["would_have_crashed"] += 1
 
-        # aggiorna storici per ε e σ (§4)
+        # update history for ε and σ (§4)
         self.estimation_errors.append(actual - self._base_estimate(state.messages))
         self.historical_consumption.append(actual)
 
@@ -313,20 +320,20 @@ class PredictiveScheduler:
         state.total_tokens_used += actual
         state.step += 1
         state.add_message("assistant", response[:350])
-        # ogni passo registra la sua chiave di idempotenza (§3.1)
+        # every step records its idempotency key (§3.1)
         state.idempotency_keys.append(f"step-{state.step}-{uuid.uuid4().hex[:8]}")
 
         return {"step": state.step, "remaining": self.remaining_tokens,
                 "estimated": estimated, "actual": actual, "action": action,
                 "risk": round(risk, 3), "model": self.backend.name}
 
-    # ---------------- §3.1: checkpoint con idempotenza ----------------
+    # ---------------- §3.1: checkpoint with idempotency ----------------
 
     def save_checkpoint(self, state: AgentState, filename="checkpoint_v4.json"):
         data = {
-            "checkpoint_id": uuid.uuid4().hex,          # identità univoca del checkpoint
+            "checkpoint_id": uuid.uuid4().hex,          # unique identity of the checkpoint
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "state": asdict(state),                      # include idempotency_keys
+            "state": asdict(state),                      # includes idempotency_keys
             "scheduler": {
                 "remaining_tokens": self.remaining_tokens,
                 "budget_used": self.budget_used,
@@ -354,7 +361,7 @@ class PredictiveScheduler:
         except Exception:
             return None
 
-    # ---------------- §8.2: riepilogo metriche ----------------
+    # ---------------- §8.2: metrics summary ----------------
 
     def metrics_summary(self) -> Dict:
         m = dict(self.metrics)
@@ -365,21 +372,23 @@ class PredictiveScheduler:
 
 
 # =============================================================================
-# 4. DEMO
+# 4. DEMO — simulated backend, illustrative only (real results in experiments/)
 # =============================================================================
 
 def run_v4(backend_type: str = "mock", model: str = "ollama/llama3.2",
            resume: bool = True, seed: Optional[int] = 42):
     print("=" * 78)
-    print("  PREDICTIVE SCHEDULER v4 — allineato al Rapporto di Ricerca v1.0")
+    print("  PREDICTIVE SCHEDULER v4 — aligned with the research report v1.0")
+    print("  NOTE: demo uses a SIMULATED backend (random numbers), for illustration")
+    print("        only. Real, reproducible results live in experiments/.")
     print("=" * 78)
 
     if backend_type == "litellm" and LITELLM_AVAILABLE:
         backend = LiteLLMBackend(model=model)
-        economy = None  # con LiteLLM potresti passare es. LiteLLMBackend("ollama/qwen2.5:0.5b")
+        economy = None  # with LiteLLM you could pass e.g. LiteLLMBackend("ollama/qwen2.5:0.5b")
     else:
         backend = MockBackend(avg_tokens=320, name="mock-standard")
-        economy = MockBackend(avg_tokens=140, name="mock-economy")  # modello "economico"
+        economy = MockBackend(avg_tokens=140, name="mock-economy")  # "cheap" model
 
     scheduler = PredictiveScheduler(
         backend=backend,
@@ -391,14 +400,14 @@ def run_v4(backend_type: str = "mock", model: str = "ollama/llama3.2",
     )
 
     state = (scheduler.load_checkpoint() if resume else None) or AgentState(
-        task_description="Analisi e refactoring di un sistema distribuito complesso",
-        messages=[{"role": "user", "content": "Analizza e rifattorizza il sistema distribuito XYZ."}],
+        task_description="Analysis and refactoring of a complex distributed system",
+        messages=[{"role": "user", "content": "Analyze and refactor the distributed system XYZ."}],
     )
     if state.step > 0:
-        # Warm Start: nella realtà si riprende quando la finestra di rate limit
-        # si è resettata → il provider restituisce di nuovo il budget pieno.
+        # Warm start: in reality you resume once the rate-limit window
+        # has reset → the provider reports a full budget again.
         scheduler.remaining_tokens = 6500
-        print(f"↻ WARM START dal checkpoint (riparto dal passo {state.step + 1}, finestra resettata)")
+        print(f"↻ WARM START from checkpoint (resuming from step {state.step + 1}, window reset)")
 
     print(f"Task: {state.task_description}")
     print("-" * 78)
@@ -413,13 +422,13 @@ def run_v4(backend_type: str = "mock", model: str = "ollama/llama3.2",
               f"{icons[d['action']]} {d['action'].upper():12s} | {d['model']}")
         if d["action"] == "checkpoint":
             fname = scheduler.save_checkpoint(state)
-            print(f"          → Checkpoint salvato: {fname} (con idempotency keys)")
+            print(f"          → Checkpoint saved: {fname} (with idempotency keys)")
             break
         time.sleep(0.05)
 
     print("-" * 78)
-    print(f"Passi: {state.step} | Token usati: {state.total_tokens_used}")
-    print("\nMetriche (§8.2):")
+    print(f"Steps: {state.step} | Tokens used: {state.total_tokens_used}")
+    print("\nMetrics (§8.2):")
     for k, v in scheduler.metrics_summary().items():
         print(f"  {k}: {v}")
     print("=" * 78)
@@ -427,7 +436,7 @@ def run_v4(backend_type: str = "mock", model: str = "ollama/llama3.2",
 
 if __name__ == "__main__":
     run_v4(
-        backend_type="mock",          # cambia in "litellm" quando vuoi
+        backend_type="mock",          # switch to "litellm" when you want real calls
         model="ollama/llama3.2",
-        resume=True,                  # riparte dal checkpoint se esiste (Warm Start)
+        resume=True,                  # resumes from the checkpoint if present (warm start)
     )

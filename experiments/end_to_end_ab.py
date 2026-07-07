@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-CONFRONTO FINALE END-TO-END — stesso task, con e senza il sistema
+FINAL END-TO-END A/B — same task, with and without the system
 ==================================================================
 
-Modello thinking reale (Qwen3), task complesso multi-passo, rate limit
-simulato con finestre di budget. Due condizioni identiche in tutto:
+Real thinking model (Qwen3), complex multi-step task, simulated rate limit
+with budget windows. Two conditions identical in every respect:
 
-  A) SENZA il sistema ("killed"): l'agente non guarda il budget. Quando
-     una chiamata sfora → 429, la sessione muore (la KV-cache del server
-     va persa, come in un vero riavvio del processo). Alla ripresa, dopo
-     il reset della finestra, deve RE-INVIARE tutta la conversazione
-     (re-prefill completo) e RIFARE il passo fallito.
+  A) WITHOUT the system ("killed"): the agent never looks at the budget.
+     When a call overshoots → 429, the session dies (the server's KV-cache
+     is lost, as in a real process restart). On resume, after the window
+     reset, it must RE-SEND the whole conversation (full re-prefill) and
+     REDO the failed step.
 
-  B) CON il sistema: lo scheduler prevede lo sforamento PRIMA della
-     chiamata, salva stato+KV su disco in una transazione, e alla ripresa
-     ripristina la KV: ricalcola solo la domanda nuova.
+  B) WITH the system: the scheduler predicts the overshoot BEFORE the
+     call, saves state+KV to disk in one transaction, and on resume
+     restores the KV: only the new question is recomputed.
 
-Misure per condizione: tempo totale, secondi spesi in recupero, token di
-prefill ricalcolati nei recuperi, errori 429 subiti, passi rifatti.
+Measures per condition: total time, seconds spent recovering, prefill
+tokens recomputed during recoveries, 429 errors suffered, steps redone.
 
-Prerequisito: llama-server attivo (avvia_warm_start_kv_pro.command).
+Prerequisite: a running llama-server.
 """
 
 import json
@@ -29,13 +29,13 @@ import time
 try:
     import requests
 except ImportError:
-    print("Manca 'requests'. Esegui: pip3 install requests")
+    print("'requests' is missing. Run: pip3 install requests")
     sys.exit(1)
 
 SERVER = "http://127.0.0.1:8080"
-KV_FILE = "confronto_finale_kv.bin"
-N_PREDICT = 512          # spazio per thinking + risposta
-BUDGET = 6500            # token per finestra di rate limit (simulata)
+KV_FILE = "end_to_end_ab_kv.bin"
+N_PREDICT = 512          # room for thinking + answer
+BUDGET = 6500            # tokens per (simulated) rate-limit window
 SAFETY_K = 2.0
 
 
@@ -67,8 +67,8 @@ def completion(messages, n_predict=N_PREDICT):
     content = d.get("content", "")
     if "</think>" in content:
         content = content.split("</think>")[-1]
-    # Contabilità da PROVIDER CLOUD: l'input si paga TUTTO a ogni chiamata
-    # (la cache locale riduce il calcolo, non il conteggio del rate limit).
+    # CLOUD-PROVIDER accounting: the input is charged IN FULL on every call
+    # (the local cache reduces compute, not the rate-limit count).
     full_input = sum(estimate_tokens(m["content"]) for m in messages)
     used = int(full_input + t.get("predicted_n", 0))
     return content.strip(), used, t
@@ -82,39 +82,39 @@ def slot(action):
 
 
 # ---------------------------------------------------------------------------
-# Il task complesso (identico nelle due condizioni)
+# The complex task (identical in both conditions)
 # ---------------------------------------------------------------------------
 
 def registry(n=60):
     rows = []
     for i in range(1, n + 1):
-        rows.append(f"MODULO servizio_{i:03d}: dipendenze {2 + i % 7}, "
-                    f"latenza p95 {60 + (i * 7) % 240} ms, error rate {round(0.1 + (i % 9) * 0.4, 1)}%, "
-                    f"copertura test {30 + (i * 13) % 60}%, "
-                    f"{'accoppiamento col gateway auth' if i % 3 == 0 else 'gestione errori incompleta' if i % 3 == 1 else 'query N+1 e cache assente'}.")
+        rows.append(f"MODULE service_{i:03d}: dependencies {2 + i % 7}, "
+                    f"p95 latency {60 + (i * 7) % 240} ms, error rate {round(0.1 + (i % 9) * 0.4, 1)}%, "
+                    f"test coverage {30 + (i * 13) % 60}%, "
+                    f"{'coupled to the auth gateway' if i % 3 == 0 else 'incomplete error handling' if i % 3 == 1 else 'N+1 queries and no cache'}.")
     return "\n".join(rows)
 
 
-SYSTEM = ("Sei un architetto software. Ragiona con attenzione e rispondi in italiano, "
-          "in modo rigoroso ma conciso (max 150 parole per risposta).")
+SYSTEM = ("You are a software architect. Reason carefully and answer "
+          "rigorously but concisely (max 150 words per answer).")
 
 QUESTIONS = [
-    "Analizza il registro e identifica i 3 moduli più critici, motivando con le metriche.",
-    "Per ciascuno dei 3, stima l'impatto di un guasto sulla catena delle dipendenze.",
-    "Proponi l'ordine di refactoring ottimale e giustificalo confrontando rischio e costo.",
-    "Scrivi il piano operativo: 3 interventi concreti per il modulo più urgente.",
+    "Analyze the registry and identify the 3 most critical modules, justifying with the metrics.",
+    "For each of the 3, estimate the impact of a failure on the dependency chain.",
+    "Propose the optimal refactoring order and justify it by weighing risk against cost.",
+    "Write the operational plan: 3 concrete interventions for the most urgent module.",
 ]
 
 
 def initial_messages():
     return [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": "REGISTRO ISPEZIONI:\n" + registry() +
-             "\n\nRispondi alle domande che seguiranno una alla volta."},
+            {"role": "user", "content": "INSPECTION REGISTRY:\n" + registry() +
+             "\n\nAnswer the upcoming questions one at a time."},
             ]
 
 
 # ---------------------------------------------------------------------------
-# Stima e budget (identici nelle due condizioni; li usa solo la B per decidere)
+# Estimation and budget (identical in both conditions; only B uses them to decide)
 # ---------------------------------------------------------------------------
 
 def estimate_tokens(text): return max(8, len(text) // 4)
@@ -132,12 +132,12 @@ def estimate_step(messages, sigma_hist):
 
 
 # ---------------------------------------------------------------------------
-# CONDIZIONE A — senza sistema: killed & cold resume
+# CONDITION A — without the system: killed & cold resume
 # ---------------------------------------------------------------------------
 
 def run_condition_a():
     print("\n" + "=" * 78)
-    print("  CONDIZIONE A — SENZA sistema (killed → cold resume)")
+    print("  CONDITION A — WITHOUT the system (killed → cold resume)")
     print("=" * 78)
     slot("erase")
     messages = initial_messages()
@@ -150,26 +150,26 @@ def run_condition_a():
         messages.append({"role": "user", "content": QUESTIONS[step]})
         est_input = sum(estimate_tokens(m["content"]) for m in messages)
 
-        # l'agente NON guarda il budget: chiama e basta
+        # the agent does NOT look at the budget: it just calls
         if est_input + N_PREDICT > remaining:
-            # ---- 429: la sessione muore ----
+            # ---- 429: the session dies ----
             stats["errors_429"] += 1
             stats["steps_redone"] += 1
-            print(f"  passo {step + 1}: ❌ 429! sessione persa, attendo il reset...")
-            remaining = BUDGET                    # finestra resettata
-            slot("erase")                         # processo morto → KV persa
+            print(f"  step {step + 1}: ❌ 429! session lost, waiting for the reset...")
+            remaining = BUDGET                    # window has reset
+            slot("erase")                         # process dead → KV lost
             t0 = time.time()
-            # cold resume: re-prefill dell'INTERA conversazione (stessa chiamata)
+            # cold resume: re-prefill of the WHOLE conversation (same call)
             text, used, t = completion(messages)
             dt = time.time() - t0
             stats["recovery_s"] += dt
             stats["reprefill_tokens"] += int(t.get("prompt_n", 0))
-            print(f"  passo {step + 1}: recupero freddo — {t.get('prompt_n', 0):.0f} tok "
-                  f"di re-prefill in {dt:.1f} s")
+            print(f"  step {step + 1}: cold recovery — {t.get('prompt_n', 0):.0f} tok "
+                  f"of re-prefill in {dt:.1f} s")
         else:
             text, used, t = completion(messages)
-            print(f"  passo {step + 1}: ok ({t.get('prompt_n', 0):.0f} tok prefill, "
-                  f"{used} usati, budget {remaining})")
+            print(f"  step {step + 1}: ok ({t.get('prompt_n', 0):.0f} tok prefill, "
+                  f"{used} used, budget {remaining})")
         remaining -= used
         messages.append({"role": "assistant", "content": text[:600]})
         step += 1
@@ -179,12 +179,12 @@ def run_condition_a():
 
 
 # ---------------------------------------------------------------------------
-# CONDIZIONE B — con il sistema: predizione + KV-checkpoint
+# CONDITION B — with the system: prediction + KV-checkpoint
 # ---------------------------------------------------------------------------
 
 def run_condition_b():
     print("\n" + "=" * 78)
-    print("  CONDIZIONE B — CON il sistema (predizione + KV warm start)")
+    print("  CONDITION B — WITH the system (prediction + KV warm start)")
     print("=" * 78)
     slot("erase")
     messages = initial_messages()
@@ -199,22 +199,22 @@ def run_condition_b():
         est, sigma = estimate_step(messages, hist)
 
         if remaining < est + SAFETY_K * sigma:
-            # ---- checkpoint PRIMA dell'errore ----
-            messages.pop()                        # la domanda si rifà alla ripresa
+            # ---- checkpoint BEFORE the error ----
+            messages.pop()                        # the question is re-asked on resume
             t0 = time.time()
-            info = slot("save")                   # KV su disco (+ stato: qui in RAM)
-            print(f"  passo {step + 1}: 🛑 checkpoint predittivo "
-                  f"({info.get('n_saved', 0)} celle KV) — attendo il reset...")
+            info = slot("save")                   # KV to disk (+ state: here in RAM)
+            print(f"  step {step + 1}: 🛑 predictive checkpoint "
+                  f"({info.get('n_saved', 0)} KV cells) — waiting for the reset...")
             remaining = BUDGET
-            slot("erase")                         # "riavvio del processo"
-            slot("restore")                       # warm start VERO dal disco
+            slot("erase")                         # "process restart"
+            slot("restore")                       # TRUE warm start from disk
             stats["recovery_s"] += time.time() - t0
-            continue                              # nessun lavoro perso
+            continue                              # no work lost
 
         text, used, t = completion(messages)
         hist.append(used)
-        print(f"  passo {step + 1}: ok ({t.get('prompt_n', 0):.0f} tok prefill, "
-              f"{used} usati, budget {remaining})")
+        print(f"  step {step + 1}: ok ({t.get('prompt_n', 0):.0f} tok prefill, "
+              f"{used} used, budget {remaining})")
         remaining -= used
         messages.append({"role": "assistant", "content": text[:600]})
         step += 1
@@ -229,32 +229,32 @@ def main():
     try:
         requests.get(f"{SERVER}/health", timeout=5).raise_for_status()
     except Exception:
-        print("ERRORE: llama-server non attivo (usa avvia_warm_start_kv_pro.command)")
+        print("ERROR: llama-server is not running (start it first)")
         sys.exit(1)
 
     print("=" * 78)
-    print("  CONFRONTO FINALE — stesso task complesso, modello thinking")
-    print(f"  4 domande di analisi | budget per finestra: {BUDGET} token")
+    print("  FINAL A/B — same complex task, thinking model")
+    print(f"  4 analysis questions | budget per window: {BUDGET} tokens")
     print("=" * 78)
 
     a = run_condition_a()
     b = run_condition_b()
 
     print("\n" + "=" * 78)
-    print("  VERDETTO")
+    print("  VERDICT")
     print("=" * 78)
-    print(f"{'':38s} {'A (senza)':>12s} {'B (con)':>12s}")
+    print(f"{'':38s} {'A (without)':>12s} {'B (with)':>12s}")
     print("-" * 66)
-    print(f"{'Errori 429 subiti':38s} {a['errors_429']:12d} {b['errors_429']:12d}")
-    print(f"{'Passi rifatti':38s} {a['steps_redone']:12d} {b['steps_redone']:12d}")
-    print(f"{'Token ri-processati nei recuperi':38s} {a['reprefill_tokens']:12d} {b['reprefill_tokens']:12d}")
-    print(f"{'Tempo speso in recupero':38s} {a['recovery_s']:11.1f}s {b['recovery_s']:11.1f}s")
-    print(f"{'Tempo totale del task':38s} {a['total_s']:11.1f}s {b['total_s']:11.1f}s")
+    print(f"{'429 errors suffered':38s} {a['errors_429']:12d} {b['errors_429']:12d}")
+    print(f"{'Steps redone':38s} {a['steps_redone']:12d} {b['steps_redone']:12d}")
+    print(f"{'Tokens re-processed in recoveries':38s} {a['reprefill_tokens']:12d} {b['reprefill_tokens']:12d}")
+    print(f"{'Time spent recovering':38s} {a['recovery_s']:11.1f}s {b['recovery_s']:11.1f}s")
+    print(f"{'Total task time':38s} {a['total_s']:11.1f}s {b['total_s']:11.1f}s")
     print("=" * 78)
 
-    with open("risultati_confronto_finale.json", "w") as f:
-        json.dump({"A_senza": a, "B_con": b}, f, indent=2)
-    print("\nSalvato in risultati_confronto_finale.json — mandamelo!")
+    with open("end_to_end_ab_results.json", "w") as f:
+        json.dump({"A_without": a, "B_with": b}, f, indent=2)
+    print("\nSaved to end_to_end_ab_results.json")
 
 
 if __name__ == "__main__":

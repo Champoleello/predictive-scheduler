@@ -36,7 +36,10 @@ core/         predictive_scheduler.py — the predictive scheduler (§4–§5 of
 examples/     react_agent.py         — ReAct agent with tools + scheduler
               groq_real_telemetry.py — real rate-limit headers (Groq)
               kv_integrated.py       — transactional state+KV checkpoint (llama.cpp)
-experiments/  parameter sweeps, KV warm-start benchmarks, LangGraph comparison
+experiments/  parameter_sweep.py       — predictive vs reactive + safety-factor sweep
+              langgraph_comparison.py  — head-to-head vs LangGraph's MemorySaver
+              end_to_end_ab.py         — full A/B with a real thinking model
+              warm_start_kv.py / warm_start_kv_pro.py — KV warm-start benchmarks
 docs/         charts
 ```
 
@@ -45,6 +48,13 @@ docs/         charts
 ```bash
 pip install requests
 python core/predictive_scheduler.py      # mock demo, no keys needed
+```
+
+> Note: the core demo uses `MockBackend` — **simulated numbers**, for
+> illustration only. The real, reproducible measurements are the scripts in
+> `experiments/`.
+
+```bash
 
 # real rate limits (free Groq key):
 export GROQ_API_KEY=gsk_...
@@ -57,9 +67,12 @@ python examples/kv_integrated.py
 
 ## Paper
 
-See *"Scheduler Predittivo Resource-Aware per Agenti LLM Autonomi"* (v1.5) for the
-formalization (risk function, checkpoint rule `T_remaining < T_estimated + k·σ`),
-the OS analogy, and full experimental protocol.
+See *"A Resource-Aware Predictive Scheduler for Autonomous LLM Agents: Proactive
+Checkpointing, Risk Management, and KV-Native Resumption"* for the formalization
+(risk function, checkpoint rule `T_remaining < T_estimated + k·σ`), the
+operating-systems analogy, and the full experimental protocol.
+
+Preprint: arXiv:XXXX.XXXXX *(link to be added once the preprint is live)*.
 
 ## License
 
